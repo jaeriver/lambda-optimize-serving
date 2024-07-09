@@ -7,10 +7,10 @@ import boto3
 import onnxruntime as ort
 
 BUCKET_NAME = os.environ.get('BUCKET_NAME')
+s3_client = boto3.client('s3')
 
 
 def load_model(model_name, model_size):
-    s3_client = boto3.client('s3')
 
     os.makedirs(os.path.dirname(f'/tmp/onnx/'), exist_ok=True)
     s3_client.download_file(BUCKET_NAME, f'models/onnx/{model_name}_{model_size}.onnx',
@@ -22,7 +22,22 @@ def load_model(model_name, model_size):
     return model
 
 
-def onnx_serving(wtype, model_name, model_size, batchsize, imgsize=224, repeat=10):
+def update_results(model_name,model_size,batchsize,lambda_memory,inference_mean, inference_median,inf_time_list,running_time):
+    info = {
+            'inference_mean' : inference_mean,
+            'inference_median' : inference_median ,
+            'inference_all' : inf_time_list,
+            'inference_handler_time' : running_time
+    }
+
+    with open(f'/tmp/{model_name}_{model_size}_{batchsize}_{lambda_memory}_inference.json','w') as f:
+        json.dump(info, f, ensure_ascii=False, indent=4)  
+    
+    s3_client.upload_file(f'/tmp/{model_name}_{model_size}_{batchsize}_{lambda_memory}_inference.json',BUCKET_NAME,f'results/onnx/intel/inference/{model_name}_{model_size}_{batchsize}_{lambda_memory}_inference.json')
+    print("upload done : convert time results")
+
+
+def onnx_serving(wtype, model_name, model_size, batchsize, imgsize=224,seq_length=128, repeat=10):
     model_path = load_model(model_name, model_size)
 
     session = ort.InferenceSession(model_path)
@@ -41,13 +56,10 @@ def onnx_serving(wtype, model_name, model_size, batchsize, imgsize=224, repeat=1
         input_data = {inname[0]: data}
 
     elif wtype == 'nlp':
-        dtype = "float32"
-        seq_length = 128
-        inputs = np.random.randint(0, 2000, size=(batchsize, seq_length)).astype(dtype)
-        token_types = np.random.uniform(size=(batchsize, seq_length)).astype(dtype)
-        valid_length = np.asarray([seq_length] * batchsize).astype(dtype)
+        inputs = np.random.randint(0, 2000, size=(batchsize, seq_length)).astype("int")
+        token_types = np.random.uniform(size=(batchsize, seq_length)).astype("int")
 
-        input_data = {inname[0]: inputs, inname[1]: token_types, inname[2]: valid_length}
+        input_data = {inname[0]: inputs, inname[1]: token_types}
 
     time_list = []
     for i in range(repeat):
@@ -56,8 +68,10 @@ def onnx_serving(wtype, model_name, model_size, batchsize, imgsize=224, repeat=1
         running_time = time.time() - start_time
         time_list.append(running_time)
 
-    res = np.median(np.array(time_list[1:]))
-    return res
+    median = np.median(np.array(time_list[1:]))
+    mean = np.mean(np.array(time_list[1:]))
+
+    return mean, median , time_list
 
 
 def lambda_handler(event, context):
@@ -70,14 +84,14 @@ def lambda_handler(event, context):
     lambda_memory = event['lambda_memory']
     batchsize = event['batchsize']
     user_email = event['user_email']
-    convert_time = event['convert_time']
     request_id = context.aws_request_id
     log_group_name = context.log_group_name
 
     if "onnx" in optimizer:
         start_time = time.time()
-        res = onnx_serving(workload_type, model_name, model_size, batchsize)
+        inference_mean, inference_median, inf_time_list = onnx_serving(workload_type, model_name, model_size, batchsize)
         running_time = time.time() - start_time
+        update_results(model_name,model_size,batchsize,lambda_memory,inference_mean, inference_median,inf_time_list,running_time)
 
         return {
             'workload_type': workload_type,
@@ -90,8 +104,6 @@ def lambda_handler(event, context):
             'batchsize': batchsize,
             'user_email': user_email,
             'execute': True,
-            'convert_time': convert_time,
-            'inference_time': running_time,
             'request_id': request_id,
             'log_group_name': log_group_name
         }

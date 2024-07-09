@@ -7,10 +7,10 @@ import boto3
 import torch
 
 BUCKET_NAME = os.environ.get('BUCKET_NAME')
+s3_client = boto3.client('s3')
 
 
 def load_model(model_name, model_size):
-    s3_client = boto3.client('s3')
 
     os.makedirs(os.path.dirname(f'/tmp/base/{model_name}_{model_size}/'), exist_ok=True)
     s3_client.download_file(BUCKET_NAME, f'models/torch/{model_name}_{model_size}/model.pt',
@@ -21,8 +21,22 @@ def load_model(model_name, model_size):
 
     return model
 
+def update_results(model_name,model_size,batchsize,lambda_memory,inference_mean, inference_median,inf_time_list,running_time):
+    info = {
+            'inference_mean' : inference_mean,
+            'inference_median' : inference_median ,
+            'inference_all' : inf_time_list,
+            'inference_handler_time' : running_time
+    }
 
-def base_serving(wtype, model_name, model_size, batchsize, imgsize=224, repeat=10):
+    with open(f'/tmp/{model_name}_{model_size}_{batchsize}_{lambda_memory}_inference.json','w') as f:
+        json.dump(info, f, ensure_ascii=False, indent=4)  
+    
+    s3_client.upload_file(f'/tmp/{model_name}_{model_size}_{batchsize}_{lambda_memory}_inference.json',BUCKET_NAME,f'results/base/intel/inference/{model_name}_{model_size}_{batchsize}_{lambda_memory}_inference.json')
+    print("upload done : inference time results")
+
+
+def base_serving(wtype, model_name, model_size, batchsize, imgsize=224,seq_length = 128, repeat=10):
     model = load_model(model_name, model_size)
     model.eval()
 
@@ -40,20 +54,21 @@ def base_serving(wtype, model_name, model_size, batchsize, imgsize=224, repeat=1
             time_list.append(running_time)
 
     elif wtype == 'nlp':
-        model.hybridize(static_alloc=True)
-        seq_length = 128
-        dtype = "float32"
-        inputs = np.random.randint(0, 2000, size=(batchsize, seq_length)).astype(dtype)
-        token_types = np.random.uniform(size=(batchsize, seq_length)).astype(dtype)
-        valid_length = np.asarray([seq_length] * batchsize).astype(dtype)
+        inputs = np.random.randint(0, 2000, size=(batchsize, seq_length)).astype("int")
+        token_types = np.random.uniform(size=(batchsize, seq_length)).astype("int")
+        tokens_tensor = torch.tensor(np.array(inputs))
+        segments_tensors = torch.tensor(np.array(token_types))
+        
         for i in range(repeat):
             start_time = time.time()
-            model(inputs, token_types, valid_length)
+            model(tokens_tensor, segments_tensors)
             running_time = time.time() - start_time
             time_list.append(running_time)
 
-    res = np.median(np.array(time_list[1:]))
-    return res
+    median = np.median(np.array(time_list[1:]))
+    mean = np.mean(np.array(time_list[1:]))
+
+    return mean, median , time_list
 
 
 def lambda_handler(event, context):
@@ -71,8 +86,9 @@ def lambda_handler(event, context):
 
     if "base" in optimizer:
         start_time = time.time()
-        res = base_serving(workload_type, model_name, model_size, batchsize)
+        inference_mean, inference_median, inf_time_list = base_serving(workload_type, model_name, model_size, batchsize)
         running_time = time.time() - start_time
+        update_results(model_name,model_size,batchsize,lambda_memory,inference_mean, inference_median,inf_time_list,running_time)
 
         return {
             'workload_type': workload_type,
@@ -85,8 +101,6 @@ def lambda_handler(event, context):
             'batchsize': batchsize,
             'user_email': user_email,
             'execute': True,
-            'convert_time': 0,
-            'inference_time': running_time,
             'request_id': request_id,
             'log_group_name': log_group_name
         }
